@@ -1,0 +1,68 @@
+{
+  "schema": "frame-framework.projectSnapshot.v1",
+  "data": {
+    "company": {
+      "name": "Supply Co.",
+      "founded": 2024,
+      "mission": "Straightforward products at honest prices.",
+      "team": [
+        "Alice",
+        "Bob",
+        "Carol"
+      ]
+    },
+    "products": [
+      {
+        "name": "Notebook",
+        "price": 12,
+        "stock": 40
+      },
+      {
+        "name": "Pen Set",
+        "price": 8,
+        "stock": 120
+      },
+      {
+        "name": "Backpack",
+        "price": 45,
+        "stock": 7
+      },
+      {
+        "name": "Ruler",
+        "price": 3,
+        "stock": 200
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "page-header",
+      "css": "",
+      "previewBody": "\n  <p>\n    <a data-navigate=\"home\">Home</a> /\n    <a data-navigate=\"about\">About</a> /\n    <a data-navigate=\"products\">Products</a>\n  </p>\n  <hr>\n  <h1>Preview</h1>\n"
+    },
+    {
+      "name": "intro-blurb",
+      "css": ".intro-blurb { color: #444; margin: 0 0 12px; max-width: 36em; }",
+      "previewBody": "\n  <p class=\"intro-blurb\">Preview text.</p>\n"
+    },
+    {
+      "name": "product-count",
+      "css": ".product-count strong { color: #0070f3; }",
+      "previewBody": "\n  <p class=\"product-count\">We carry <strong>0</strong> products.</p>\n"
+    },
+    {
+      "name": "product-row",
+      "css": "",
+      "previewBody": "\n  <tr>\n    <td>Sample</td>\n    <td>$0</td>\n    <td>0 left</td>\n  </tr>\n"
+    },
+    {
+      "name": "team-member",
+      "css": "",
+      "previewBody": "\n  <li>Sample</li>\n"
+    }
+  ],
+  "meta": {
+    "generatedFrom": "web-framework/example/app.js",
+    "generatedAt": "2026-04-08T20:50:32.568Z"
+  }
+}

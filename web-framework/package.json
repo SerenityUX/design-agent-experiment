@@ -1,0 +1,15 @@
+{
+  "name": "frame-framework",
+  "version": "0.1.0",
+  "description": "A lightweight Node.js framework for multi-frame web apps",
+  "main": "src/index.js",
+  "bin": {
+    "frame": "bin/frame.js"
+  },
+  "scripts": {
+    "dev": "node bin/frame.js example/app.js --mode=play",
+    "preview": "node bin/frame.js example/app.js --mode=preview",
+    "snapshot:desktop": "node scripts/write-snapshot-to-desktop.js"
+  },
+  "license": "MIT"
+}
