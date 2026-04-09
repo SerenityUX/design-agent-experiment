@@ -4,6 +4,10 @@ An AI-powered UI design tool that lets you visually build multi-page interfaces 
 
 ![Demo](videoDemo.gif)
 
+### Demo 2 — Minimalist UI
+
+![Demo 2](videoDemo2.gif)
+
 ---
 
 ## What it does

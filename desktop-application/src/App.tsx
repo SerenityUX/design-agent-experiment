@@ -7,6 +7,7 @@ import {
   type MutableRefObject,
   type ReactNode,
 } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import { FRAMES, buildSrcDoc, type FrameDef } from './frameContent'
 import {
   buildUnifiedLayerRoot,
@@ -23,6 +24,9 @@ import {
   ChatPanel,
   type PageDef, type ChatAction,
   type ComponentDef, type DataAction, type ComponentAction,
+  TurnView,
+  type TurnEntry, type ChatPanelHandle,
+  type ImagineConceptResult,
 } from './ChatPanel'
 import { LeftBarBottomPanel } from './LeftBarBottomPanel'
 import frameProjectSnapshot from './frameProjectSnapshot.json'
@@ -45,6 +49,58 @@ const PAD = 100
 
 const CANVAS_ZOOM_MIN = 0.05
 const CANVAS_ZOOM_MAX = 4
+
+const IMAGINATION_STORAGE_KEY = 'ui-ast-imaginations-v1'
+
+type StoredImagination = ImagineConceptResult & {
+  id: string
+  sessionPrompt: string
+  turnId: string
+  toolCallId: string
+  index: number
+}
+
+function loadImaginationsFromStorage(): StoredImagination[] {
+  try {
+    const raw = localStorage.getItem(IMAGINATION_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed) ? (parsed as StoredImagination[]) : []
+  } catch {
+    return []
+  }
+}
+
+function saveImaginationsToStorage(items: StoredImagination[]) {
+  try {
+    localStorage.setItem(IMAGINATION_STORAGE_KEY, JSON.stringify(items))
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function collectImaginationsFromTurns(turns: TurnEntry[]): StoredImagination[] {
+  const out: StoredImagination[] = []
+  for (const turn of turns) {
+    if (turn.role !== 'assistant') continue
+    for (const tc of turn.toolCalls) {
+      const concepts = tc.change?.imagineConcepts
+      if (!concepts?.length) continue
+      const sessionPrompt = tc.change?.label ?? 'imagine'
+      concepts.forEach((c, i) => {
+        out.push({
+          ...c,
+          id: `${turn.id}:${tc.id}:${i}`,
+          sessionPrompt,
+          turnId: turn.id,
+          toolCallId: tc.id,
+          index: i,
+        })
+      })
+    }
+  }
+  return out
+}
 
 type CanvasView = { zoom: number; panX: number; panY: number }
 
@@ -287,6 +343,49 @@ function highlightHTML(raw: string): string {
 
 export default function App() {
   const [jsonCode, setJsonCode]         = useState(DEFAULT_JSON)
+  const [minimalUI, setMinimalUI]                     = useState(true)
+  const [minimalInputFocused, setMinimalInputFocused] = useState(false)
+  const [minimalInputValue, setMinimalInputValue]     = useState('')
+  const [minimalChatTurns, setMinimalChatTurns]       = useState<TurnEntry[]>([])
+  const [minimalLoading, setMinimalLoading]           = useState(false)
+  const chatPanelRef = useRef<ChatPanelHandle>(null)
+  const minimalMessagesRef = useRef<HTMLDivElement>(null)
+
+  const handleTurnsChange = useCallback((turns: TurnEntry[]) => {
+    setMinimalChatTurns(turns)
+    const last = turns[turns.length - 1]
+    setMinimalLoading(!!last && last.role === 'assistant' && !last.done)
+  }, [])
+
+  const [imaginationGalleryOpen, setImaginationGalleryOpen] = useState(false)
+  const [storedImaginations, setStoredImaginations] = useState<StoredImagination[]>(loadImaginationsFromStorage)
+
+  useEffect(() => {
+    const fromTurns = collectImaginationsFromTurns(minimalChatTurns)
+    if (fromTurns.length === 0) return
+    setStoredImaginations(prev => {
+      const byId = new Map<string, StoredImagination>()
+      for (const x of prev) byId.set(x.id, x)
+      for (const x of fromTurns) byId.set(x.id, x)
+      const next = [...byId.values()]
+      saveImaginationsToStorage(next)
+      return next
+    })
+  }, [minimalChatTurns])
+
+  useEffect(() => {
+    if (!imaginationGalleryOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setImaginationGalleryOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [imaginationGalleryOpen])
+
+  useEffect(() => {
+    const el = minimalMessagesRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [minimalChatTurns])
   const [frameContents, setFrameContents] = useState<Record<string, FrameDef>>({ ...FRAMES })
   const [canvasView, setCanvasView]     = useState<CanvasView>({ zoom: 0.5, panX: 0, panY: 0 })
   const [leftWidth, setLeftWidth]       = useState(260)
@@ -810,12 +909,20 @@ export default function App() {
     syncUiAstOutlines()
   }, [syncUiAstOutlines])
 
+  useEffect(() => {
+    const unlisten = listen('toggle-minimal-ui', () => {
+      setMinimalUI(prev => !prev)
+    })
+    return () => { unlisten.then(fn => fn()) }
+  }, [])
+
   const rightPrototypeHint = 'Select a frame on the left to edit prototype source.'
 
   return (
     <div style={css.root}>
+      <style>{`.minimal-messages::-webkit-scrollbar{display:none}.minimal-messages{-ms-overflow-style:none;scrollbar-width:none}`}</style>
 
-      <aside style={{ ...css.leftSidebar, width: leftWidth }}>
+      {!minimalUI && <aside style={{ ...css.leftSidebar, width: leftWidth }}>
         <div style={css.frameTabBar}>
           <button
             type="button"
@@ -888,9 +995,9 @@ export default function App() {
           </div>
           <LeftBarBottomPanel snapshot={liveSnapshot} onDatasetChange={handleDatasetChange} />
         </div>
-      </aside>
+      </aside>}
 
-      <div style={css.divider} onMouseDown={onLeftDividerMouseDown} />
+      {!minimalUI && <div style={css.divider} onMouseDown={onLeftDividerMouseDown} />}
 
       <div ref={canvasAreaRef} style={css.canvasArea}>
         <div
@@ -1003,9 +1110,9 @@ export default function App() {
         </div>
       </div>
 
-      <div style={css.divider} onMouseDown={onRightDividerMouseDown} />
+      {!minimalUI && <div style={css.divider} onMouseDown={onRightDividerMouseDown} />}
 
-      <aside style={{ ...css.rightSidebar, width: rightWidth }}>
+      <aside style={{ ...css.rightSidebar, width: rightWidth, display: minimalUI ? 'none' : 'flex' }}>
         <div style={css.rightTabBar}>
           {(['chat', 'element', 'prototype'] as RightTab[]).map(t => {
             const active = rightTab === t
@@ -1029,8 +1136,9 @@ export default function App() {
         </div>
 
         <div style={css.rightPanelBody}>
-          {rightTab === 'chat' && (
+          <div style={{ display: rightTab === 'chat' ? 'contents' : 'none' }}>
             <ChatPanel
+              ref={chatPanelRef}
               contextHint={elementNameForChat || undefined}
               pages={chatPages}
               dataStore={liveDataset}
@@ -1038,8 +1146,9 @@ export default function App() {
               onApplyActions={handleChatActions}
               onApplyDataAction={handleDataAction}
               onApplyComponentAction={handleComponentAction}
+              onTurnsChange={handleTurnsChange}
             />
-          )}
+          </div>
 
           {rightTab === 'element' && (
             <div style={css.rightTabScroll}>
@@ -1128,6 +1237,263 @@ export default function App() {
           )}
         </div>
       </aside>
+
+      {minimalUI && (
+        <div style={css.minimalContainer}>
+          {minimalInputFocused && minimalChatTurns.length > 0 && (
+            <div style={css.minimalMessagesOuter}>
+              <div ref={minimalMessagesRef} className="minimal-messages" style={css.minimalMessages}>
+                <div style={css.minimalMessagesInner}>
+                  <div style={{ flex: 1 }} />
+                  {minimalChatTurns.map(turn => (
+                    <TurnView key={turn.id} turn={turn} />
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          <div style={{ ...css.minimalInputWrap, border: `1px solid ${minimalInputFocused ? '#000' : '#DCDCDC'}` }}>
+            <img
+              src={minimalLoading ? '/cursorOutline.svg' : '/cursor.svg'}
+              alt=""
+              style={css.minimalInputIcon}
+            />
+            <input
+              style={css.minimalInput}
+              value={minimalInputValue}
+              onChange={e => setMinimalInputValue(e.target.value)}
+              placeholder="What are we designing?"
+              onFocus={() => setMinimalInputFocused(true)}
+              onBlur={() => setMinimalInputFocused(false)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  const text = minimalInputValue.trim()
+                  if (text) {
+                    chatPanelRef.current?.sendMessage(text)
+                    setMinimalInputValue('')
+                  }
+                }
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {storedImaginations.length > 0 && (
+        <button
+          type="button"
+          aria-label="Open imagination gallery"
+          onClick={() => setImaginationGalleryOpen(true)}
+          style={{
+            position: 'fixed',
+            top: 16,
+            left: 16,
+            zIndex: 120,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 0,
+            padding: '6px 10px 6px 6px',
+            borderRadius: 999,
+            border: '1px solid rgba(0,0,0,0.08)',
+            background: 'rgba(255,255,255,0.92)',
+            boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
+            cursor: 'pointer',
+            backdropFilter: 'blur(8px)',
+          }}
+        >
+          <span style={{ position: 'relative', width: 36, height: 28, flexShrink: 0 }}>
+            {storedImaginations
+              .filter(i => i.imageDataUrl)
+              .slice(-4)
+              .map((im, stackIdx, arr) => (
+                <span
+                  key={im.id}
+                  style={{
+                    position: 'absolute',
+                    left: stackIdx * 8,
+                    top: 2,
+                    width: 24,
+                    height: 24,
+                    borderRadius: '50%',
+                    overflow: 'hidden',
+                    border: '2px solid #fff',
+                    boxShadow: '0 1px 4px rgba(0,0,0,0.12)',
+                    zIndex: arr.length - stackIdx,
+                    background: '#ddd',
+                  }}
+                >
+                  {im.imageDataUrl && (
+                    <img src={im.imageDataUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  )}
+                </span>
+              ))}
+            {storedImaginations.filter(i => i.imageDataUrl).length === 0 && (
+              <span
+                style={{
+                  position: 'absolute',
+                  left: 0,
+                  top: 2,
+                  width: 24,
+                  height: 24,
+                  borderRadius: '50%',
+                  background: 'linear-gradient(135deg,#6366f1,#a855f7)',
+                  border: '2px solid #fff',
+                }}
+              />
+            )}
+          </span>
+          <span style={{
+            fontSize: 11,
+            fontWeight: 600,
+            color: '#333',
+            fontFamily: 'system-ui,-apple-system,sans-serif',
+            marginLeft: 4,
+          }}>
+            {storedImaginations.length}
+          </span>
+        </button>
+      )}
+
+      {imaginationGalleryOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Imagined UIs"
+          onClick={e => { if (e.target === e.currentTarget) setImaginationGalleryOpen(false) }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 300,
+            background: '#000',
+            overflow: 'auto',
+            padding: '24px 20px 48px',
+            WebkitOverflowScrolling: 'touch',
+          }}
+        >
+          <div style={{ maxWidth: 1200, margin: '0 auto' }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              marginBottom: 20,
+              position: 'sticky',
+              top: 0,
+              background: '#000',
+              paddingBottom: 8,
+              zIndex: 1,
+            }}>
+              <h2 style={{
+                margin: 0,
+                fontSize: 18,
+                fontWeight: 600,
+                color: '#fff',
+                fontFamily: 'system-ui,-apple-system,sans-serif',
+              }}>
+                Imagined UIs
+              </h2>
+              <button
+                type="button"
+                onClick={() => setImaginationGalleryOpen(false)}
+                style={{
+                  border: '1px solid #444',
+                  background: '#111',
+                  color: '#fff',
+                  borderRadius: 8,
+                  padding: '8px 14px',
+                  fontSize: 13,
+                  cursor: 'pointer',
+                  fontFamily: 'system-ui,-apple-system,sans-serif',
+                }}
+              >
+                Close
+              </button>
+            </div>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+              gap: 20,
+            }}>
+              {storedImaginations.map(im => (
+                <article
+                  key={im.id}
+                  style={{
+                    background: '#111',
+                    borderRadius: 12,
+                    overflow: 'hidden',
+                    border: '1px solid #222',
+                  }}
+                >
+                  <div style={{ aspectRatio: '4/3', background: '#1a1a1a' }}>
+                    {im.imageDataUrl ? (
+                      <img
+                        src={im.imageDataUrl}
+                        alt={im.name}
+                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                      />
+                    ) : (
+                      <div style={{
+                        height: '100%',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: '#c0392b',
+                        fontSize: 12,
+                        padding: 12,
+                        textAlign: 'center',
+                        fontFamily: 'ui-monospace,monospace',
+                      }}>
+                        {im.error ?? 'No image'}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ padding: '12px 14px 16px' }}>
+                    <div style={{
+                      fontSize: 11,
+                      color: '#888',
+                      marginBottom: 4,
+                      fontFamily: 'system-ui,-apple-system,sans-serif',
+                    }}>
+                      {im.sessionPrompt}
+                    </div>
+                    <h3 style={{
+                      margin: '0 0 8px',
+                      fontSize: 15,
+                      fontWeight: 600,
+                      color: '#fff',
+                      fontFamily: 'system-ui,-apple-system,sans-serif',
+                    }}>
+                      {im.name}
+                    </h3>
+                    {im.agentLikes && (
+                      <p style={{
+                        margin: 0,
+                        fontSize: 13,
+                        lineHeight: 1.5,
+                        color: '#c4c4c4',
+                        fontFamily: 'system-ui,-apple-system,sans-serif',
+                      }}>
+                        {im.agentLikes}
+                      </p>
+                    )}
+                    {!im.agentLikes && im.description && (
+                      <p style={{
+                        margin: 0,
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                        color: '#777',
+                        fontFamily: 'system-ui,-apple-system,sans-serif',
+                      }}>
+                        {im.description.slice(0, 280)}{im.description.length > 280 ? '…' : ''}
+                      </p>
+                    )}
+                  </div>
+                </article>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1432,6 +1798,98 @@ const css = {
   editorTextarea: {
     ...editorBase,
     color: 'transparent',
+    caretColor: '#000',
+  } satisfies React.CSSProperties,
+
+  minimalContainer: {
+    position: 'fixed',
+    bottom: 16,
+    left: '50%',
+    transform: 'translateX(-50%)',
+    width: 360,
+    zIndex: 100,
+  } satisfies React.CSSProperties,
+
+  minimalMessagesOuter: {
+    position: 'absolute',
+    bottom: '100%',
+    left: 0,
+    right: 0,
+    marginBottom: 8,
+    minHeight: 200,
+    maxHeight: 400,
+    WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.6) 25%, rgba(0,0,0,0.85) 50%, rgba(0,0,0,0.95) 75%, black 200px)',
+    maskImage: 'linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.6) 25%, rgba(0,0,0,0.85) 50%, rgba(0,0,0,0.95) 75%, black 200px)',
+  } satisfies React.CSSProperties,
+
+  minimalMessages: {
+    width: '100%',
+    height: '100%',
+    minHeight: 200,
+    maxHeight: 400,
+    overflow: 'scroll',
+    display: 'flex',
+    flexDirection: 'column',
+  } satisfies React.CSSProperties,
+
+  minimalMessagesInner: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    padding: '0 2px',
+    flex: 1,
+  } satisfies React.CSSProperties,
+
+  minimalUserBubble: {
+    alignSelf: 'flex-end',
+    background: '#0070f3',
+    color: '#fff',
+    borderRadius: '12px 12px 3px 12px',
+    padding: '7px 11px',
+    fontSize: 13,
+    lineHeight: 1.4,
+    maxWidth: '85%',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  } satisfies React.CSSProperties,
+
+  minimalAssistantBubble: {
+    alignSelf: 'flex-start',
+    color: '#333',
+    fontSize: 13,
+    lineHeight: 1.4,
+    maxWidth: '85%',
+    whiteSpace: 'pre-wrap',
+    wordBreak: 'break-word',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+  } satisfies React.CSSProperties,
+
+  minimalInputWrap: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    background: '#fff',
+    borderRadius: 12,
+    padding: '13px 18px',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
+  } satisfies React.CSSProperties,
+
+  minimalInputIcon: {
+    width: 16,
+    height: 16,
+    flexShrink: 0,
+    opacity: 0.5,
+  } satisfies React.CSSProperties,
+
+  minimalInput: {
+    flex: 1,
+    border: 'none',
+    outline: 'none',
+    background: 'transparent',
+    fontSize: 15,
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    color: '#000',
     caretColor: '#000',
   } satisfies React.CSSProperties,
 } as const

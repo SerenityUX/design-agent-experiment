@@ -5,12 +5,13 @@
  * Five tools give the AI read/write access to every page in the prototype.
  */
 
-import { useEffect, useRef, useState, useCallback, type CSSProperties } from 'react'
+import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, type CSSProperties } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { invoke } from '@tauri-apps/api/core'
 import { Agent } from '@mariozechner/pi-agent-core'
 import { streamSimple, getModels, Type } from '@mariozechner/pi-ai'
 import type { AgentTool, AgentEvent } from '@mariozechner/pi-agent-core'
-import type { TextContent } from '@mariozechner/pi-ai'
+import type { TextContent, ImageContent } from '@mariozechner/pi-ai'
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -48,10 +49,21 @@ export type ComponentAction =
 
 type DiffLine = { kind: 'add' | 'remove' | 'same'; text: string }
 
+export type ImagineConceptResult = {
+  name: string
+  description: string
+  imageDataUrl: string | null
+  /** Short appreciation of this direction — generated alongside the image */
+  agentLikes?: string
+  error?: string
+}
+
 type AppliedChange = {
   actionType: string
   label: string
   diff?: DiffLine[]
+  screenshotDataUrl?: string
+  imagineConcepts?: ImagineConceptResult[]
 }
 
 type ToolCallEntry = {
@@ -62,12 +74,16 @@ type ToolCallEntry = {
   change?: AppliedChange
 }
 
-type TurnEntry = {
+export type TurnEntry = {
   id: string
   role: 'user' | 'assistant'
   text: string
   toolCalls: ToolCallEntry[]
   done: boolean
+}
+
+export type ChatPanelHandle = {
+  sendMessage(text: string): void
 }
 
 // ─── Diff ─────────────────────────────────────────────────────────────────────
@@ -172,6 +188,12 @@ function buildSystemPrompt(
 
   return `You are an AI assistant embedded in **ui-ast**, a prototyping tool built on the **Frame framework**.
 You can read and write pages, the data store, and the component registry.
+
+When asked to design or create UI — especially new pages or features — use the **\`imagine\`** tool first to visually explore creative directions. Generate images of several wildly different concepts, pick the one that feels most exciting and unexpected, then build it. Favor bold, creative, out-there aesthetic choices over safe defaults.
+
+After **\`imagine\`** returns, your reasoning should briefly note what you **like** about **each** imagined direction (specific qualities: palette, type, layout, mood, novelty) before you commit to one. The tool attaches draft “likes” per concept; expand on them in your own voice where it helps.
+
+Use **\`search_design_inspiration\`** when you need real-world references — before building, to ground your aesthetic choices in actual sites, or when the user asks about specific design styles, trends, or wants inspiration from existing work.
 
 ---
 
@@ -603,7 +625,234 @@ function makeTools(
     },
   }
 
+  const takeLookTool: AgentTool<any, AppliedChange> = {
+    label: 'Take a Look',
+    name: 'take_look',
+    description: 'Capture a screenshot of what the user currently sees on screen. Use this to visually inspect the current state of the canvas before making changes.',
+    parameters: Type.Object({}),
+    async execute() {
+      const base64 = await invoke<string>('take_screenshot')
+      const dataUrl = `data:image/png;base64,${base64}`
+      const imageContent: ImageContent = { type: 'image', data: base64, mimeType: 'image/png' }
+      return {
+        content: [imageContent, { type: 'text', text: 'Screenshot captured.' } as TextContent],
+        details: { actionType: 'take_look', label: 'screenshot', screenshotDataUrl: dataUrl },
+      }
+    },
+  }
+
+  const imagineTool: AgentTool<any, AppliedChange | null> = {
+    label: 'Imagine',
+    name: 'imagine',
+    description: `Visually imagine multiple creative UI concepts for a prompt. Brainstorms wildly different design directions, generates rendered images of each, then asks which direction feels most promising. Favor creative, unconventional, out-there aesthetics. Use this before building to explore possibilities.`,
+    parameters: Type.Object({
+      prompt: Type.String({ description: 'The UI or feature to imagine — e.g. "settings page for a music app", "onboarding flow", "analytics dashboard"' }),
+      num_concepts: Type.Optional(Type.Number({ description: 'Number of visual concepts to generate (default 4)' })),
+    }),
+    async execute(_id, params) {
+      const apiKey = import.meta.env.VITE_OPENROUTER_API_KEY as string
+      const numConcepts = Math.min(params.num_concepts ?? 4, 5)
+
+      async function fetchAgentLikes(concept: { name: string; imagePrompt: string }): Promise<string> {
+        try {
+          const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: 'openai/gpt-4o-mini',
+              messages: [{
+                role: 'user',
+                content:
+                  `You are reviewing one imagined UI mockup direction.\n` +
+                  `Title: "${concept.name}"\n` +
+                  `Visual brief: ${concept.imagePrompt}\n\n` +
+                  `In 2–3 short sentences, name specific things to appreciate about this direction ` +
+                  `(color, typography, layout energy, materials, mood, novelty). No preamble — just the appreciation.`,
+              }],
+              max_tokens: 200,
+            }),
+          })
+          const data = await resp.json() as { choices?: { message?: { content?: string } }[] }
+          return (data.choices?.[0]?.message?.content ?? '').trim()
+        } catch {
+          return ''
+        }
+      }
+
+      // Step 1: Generate diverse creative concept descriptions via LLM
+      let concepts: Array<{ name: string; imagePrompt: string }> = []
+
+      try {
+        const conceptResp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'openai/gpt-4o-mini',
+            messages: [{
+              role: 'user',
+              content: `You are an experimental UI designer who loves pushing creative limits. Generate ${numConcepts} wildly different visual concept directions for this UI: "${params.prompt}"
+
+Go for maximum diversity. Include unexpected aesthetic directions — think brutalist zine layouts, ancient manuscript textures, deep-ocean bioluminescence, neon noir terminals, living botanical organics, quantum crystalline data, surrealist melting interfaces, bold pop-art geometry. Avoid obvious choices.
+
+For each concept:
+- name: 3-5 word evocative title
+- imagePrompt: A vivid, detailed image-generation prompt describing a UI mockup screenshot. Include color palette, typography style, layout, textures/materials, lighting, mood, visible UI elements.
+
+Respond with ONLY a raw JSON array, no markdown fences, no other text:
+[{"name":"...","imagePrompt":"..."}]`,
+            }],
+          }),
+        })
+        const conceptData = await conceptResp.json() as any
+        const raw: string = conceptData.choices?.[0]?.message?.content ?? ''
+        const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim()
+        const parsed = JSON.parse(cleaned)
+        concepts = Array.isArray(parsed) ? parsed : []
+      } catch {
+        concepts = [
+          { name: 'Neon Noir Terminal', imagePrompt: `Dark cyberpunk UI mockup for ${params.prompt}. Pure black background, electric cyan and magenta neon glows, holographic glass panels, CRT scanline texture, monospace type, sharp chrome geometry.` },
+          { name: 'Ancient Vellum', imagePrompt: `Aged manuscript UI mockup for ${params.prompt}. Cream vellum parchment texture, illuminated gold leaf accents, medieval serif calligraphy, ink-wash illustrations, candlelight amber warmth.` },
+          { name: 'Brutalist Zine', imagePrompt: `Brutalist design UI mockup for ${params.prompt}. Black and white with neon yellow, massive bold type crashing the grid, cut-paste collage elements, raw HTML newspaper energy, 90s underground zine aesthetic.` },
+          { name: 'Bioluminescent Abyss', imagePrompt: `Deep ocean bioluminescence UI mockup for ${params.prompt}. Black abyss background, glowing teal and violet organic blobs, jellyfish translucent panels, floating spore particles, ethereal underwater light shafts.` },
+        ]
+      }
+
+      concepts = concepts.slice(0, numConcepts)
+
+      /** OpenRouter Gemini image models need modalities; images are returned on message.images (not always message.content). */
+      function extractOpenRouterImageDataUrl(imgData: any): string | null {
+        const message = imgData?.choices?.[0]?.message
+        if (!message) return null
+
+        const fromImages = message.images
+        if (Array.isArray(fromImages)) {
+          for (const block of fromImages) {
+            const url = block?.image_url?.url ?? block?.imageUrl?.url
+            if (typeof url === 'string' && url.length > 0) return url
+          }
+        }
+
+        const msgContent = message.content
+        if (Array.isArray(msgContent)) {
+          for (const block of msgContent) {
+            if (block?.type === 'image_url' && block.image_url?.url) {
+              return block.image_url.url
+            }
+            if (block?.type === 'image' && block.source?.data) {
+              return `data:${block.source.media_type ?? 'image/jpeg'};base64,${block.source.data}`
+            }
+          }
+        } else if (typeof msgContent === 'string' && msgContent.length > 0) {
+          if (msgContent.startsWith('data:')) {
+            return msgContent
+          }
+          if (msgContent.match(/^[A-Za-z0-9+/]{20}/)) {
+            const mimeType = msgContent.startsWith('iVBOR') ? 'image/png' : 'image/jpeg'
+            return `data:${mimeType};base64,${msgContent}`
+          }
+        }
+        return null
+      }
+
+      // Step 2: For each concept, generate appreciation notes + image in parallel
+      const results = await Promise.all(concepts.map(async (concept): Promise<ImagineConceptResult> => {
+        const likesPromise = fetchAgentLikes(concept)
+        const imagePromise = (async (): Promise<Omit<ImagineConceptResult, 'agentLikes'>> => {
+          try {
+            const imgResp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: 'google/gemini-3.1-flash-image-preview',
+                modalities: ['image', 'text'],
+                messages: [{ role: 'user', content: `UI design mockup screenshot: ${concept.imagePrompt}` }],
+                image_config: {
+                  aspect_ratio: '16:9',
+                  image_size: '1K',
+                },
+              }),
+            })
+            const imgData = await imgResp.json() as any
+
+            if (!imgResp.ok) {
+              const errMsg = imgData?.error?.message ?? imgData?.message ?? JSON.stringify(imgData).slice(0, 300)
+              return { name: concept.name, description: concept.imagePrompt, imageDataUrl: null, error: `HTTP ${imgResp.status}: ${errMsg}` }
+            }
+
+            const imageDataUrl = extractOpenRouterImageDataUrl(imgData)
+
+            if (!imageDataUrl) {
+              const preview = JSON.stringify(imgData).slice(0, 400)
+              return { name: concept.name, description: concept.imagePrompt, imageDataUrl: null, error: `No image in response: ${preview}` }
+            }
+
+            return { name: concept.name, description: concept.imagePrompt, imageDataUrl }
+          } catch (e) {
+            return { name: concept.name, description: concept.imagePrompt, imageDataUrl: null, error: String(e) }
+          }
+        })()
+
+        const [agentLikes, img] = await Promise.all([likesPromise, imagePromise])
+        return { ...img, agentLikes: agentLikes || undefined }
+      }))
+
+      // Build content blocks for the model (images sent for vision)
+      const blocks: (TextContent | ImageContent)[] = []
+      for (const r of results) {
+        blocks.push(text(`**${r.name}**`))
+        if (r.agentLikes) {
+          blocks.push(text(`_What stands out:_ ${r.agentLikes}`))
+        }
+        if (r.imageDataUrl) {
+          const base64 = r.imageDataUrl.replace(/^data:[^;]+;base64,/, '')
+          const mimeMatch = r.imageDataUrl.match(/^data:([^;]+)/)
+          blocks.push({ type: 'image', data: base64, mimeType: mimeMatch?.[1] ?? 'image/jpeg' } as ImageContent)
+        } else {
+          blocks.push(text(`_(image generation failed${r.error ? ': ' + r.error : ''})_`))
+        }
+      }
+      blocks.push(text(
+        `\nYou pictured these different UIs in your brain — which feels like the best direction to continue down? Let your instincts and taste guide you. Pick the concept that excites you most and explain why, then proceed with that vision.`
+      ))
+
+      return {
+        content: blocks,
+        details: { actionType: 'imagine', label: params.prompt, imagineConcepts: results },
+      }
+    },
+  }
+
+  const searchDesignInspirationTool: AgentTool<any, null> = {
+    label: 'Search Design',
+    name: 'search_design_inspiration',
+    description:
+      'Search the web for design inspiration, UI references, visual trends, or specific design patterns using Perplexity. ' +
+      'Use this when you need real-world examples — e.g. "fintech dashboard dark mode", "brutalist portfolio sites 2024", "apple-style onboarding flows", "color palettes for wellness apps". ' +
+      'Returns live web results with sources.',
+    parameters: Type.Object({
+      query: Type.String({ description: 'Design search query — be specific for better results, e.g. "minimal dark mode crypto wallet UI" or "bold editorial typography landing pages"' }),
+    }),
+    async execute(_id, params) {
+      const apiKey = import.meta.env.VITE_OPENROUTER_API_KEY as string
+      const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'perplexity/sonar',
+          messages: [{
+            role: 'user',
+            content: `Search for design inspiration: ${params.query}\n\nFind real examples, notable sites, visual references, and design patterns. Include specific URLs where possible. Focus on visual design quality, aesthetic direction, and what makes these examples stand out.`,
+          }],
+        }),
+      })
+      const data = await resp.json() as any
+      const content = data.choices?.[0]?.message?.content ?? 'No results returned.'
+      return { content: [text(content)], details: null }
+    },
+  }
+
   return [
+    takeLookTool, imagineTool, searchDesignInspirationTool,
     listPagesTool, readPageTool, setPageTool, createPageTool, deletePageTool,
     readDatastoreTool, setDataTool, deleteDataTool,
     listComponentsTool, readComponentTool, setComponentTool, deleteComponentTool,
@@ -623,7 +872,7 @@ const globalStyles = `
 .chat-md p:last-child { margin-bottom: 0; }
 .chat-md ul, .chat-md ol { margin: 0 0 0.65em; padding-left: 1.25em; }
 .chat-md li { margin-bottom: 0.2em; }
-.chat-md pre { margin: 0.5em 0; padding: 10px 12px; background: #f4f4f4; border-radius: 6px; overflow: auto; font-size: 12px; font-family: ${FONT_MONO}; }
+.chat-md pre { margin: 0.5em 0; padding: 12px 14px; background: #f6f6f6; border: 1px solid #e0e0e0; border-radius: 7px; overflow: auto; font-size: 12px; font-family: ${FONT_MONO}; }
 .chat-md code { font-family: ${FONT_MONO}; font-size: 12px; background: #f0f0f0; padding: 0.1em 0.35em; border-radius: 4px; }
 .chat-md pre code { background: transparent; padding: 0; }
 .chat-md h1, .chat-md h2, .chat-md h3 { margin: 0.75em 0 0.4em; font-weight: 600; font-family: ${FONT_UI}; }
@@ -717,6 +966,79 @@ function ToolCallBubble({ tc }: { tc: ToolCallEntry }) {
           </span>
         )}
       </button>
+      {tc.change?.screenshotDataUrl && (
+        <div style={{ marginTop: 6 }}>
+          <img
+            src={tc.change.screenshotDataUrl}
+            alt="Screenshot"
+            style={{
+              width: '100%', maxWidth: 260, display: 'block',
+              borderRadius: 6, border: '1px solid #e0e0e0',
+              boxShadow: '0 1px 4px rgba(0,0,0,0.08)',
+            }}
+          />
+        </div>
+      )}
+      {tc.change?.imagineConcepts && tc.change.imagineConcepts.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(2, 1fr)',
+            gap: 7,
+          }}>
+            {tc.change.imagineConcepts.map((concept, i) => (
+              <div
+                key={i}
+                style={{
+                  borderRadius: 8, overflow: 'hidden',
+                  border: '1px solid #e0e0e0',
+                  boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+                  background: '#f5f5f5',
+                }}
+              >
+                {concept.imageDataUrl ? (
+                  <img
+                    src={concept.imageDataUrl}
+                    alt={concept.name}
+                    style={{ width: '100%', display: 'block' }}
+                  />
+                ) : (
+                  <div style={{
+                    minHeight: 80, padding: '8px',
+                    display: 'flex', alignItems: 'flex-start',
+                    fontSize: 9, color: '#c0392b', fontFamily: FONT_MONO,
+                    background: '#fff5f5', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                    lineHeight: 1.4,
+                  }}>
+                    {concept.error ?? 'no image'}
+                  </div>
+                )}
+                <div style={{
+                  padding: '5px 8px',
+                  fontSize: 10, fontWeight: 600,
+                  color: '#444', fontFamily: FONT_UI,
+                  background: '#fff',
+                  borderTop: '1px solid #ebebeb',
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                }}>
+                  {concept.name}
+                </div>
+                {concept.agentLikes && (
+                  <div style={{
+                    padding: '6px 8px 8px',
+                    fontSize: 10, lineHeight: 1.45,
+                    color: '#555', fontFamily: FONT_UI,
+                    background: '#fafafa',
+                    borderTop: '1px solid #f0f0f0',
+                  }}>
+                    {concept.agentLikes}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {open && tc.change?.diff && (
         <div style={{ marginTop: 5 }}>
           <DiffView diff={tc.change.diff} />
@@ -726,17 +1048,42 @@ function ToolCallBubble({ tc }: { tc: ToolCallEntry }) {
   )
 }
 
+// ─── TurnView (exported for use in minimal UI) ───────────────────────────────
+
+export function TurnView({ turn }: { turn: TurnEntry }) {
+  if (turn.role === 'user') {
+    return (
+      <div style={{
+        alignSelf: 'flex-end', maxWidth: '88%', flexShrink: 0,
+        background: '#0070f3', color: '#fff',
+        borderRadius: '12px 12px 3px 12px',
+        padding: '8px 12px', fontSize: 13, lineHeight: 1.45,
+        fontFamily: FONT_UI, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+      }}>
+        {turn.text}
+      </div>
+    )
+  }
+  return (
+    <div style={{ alignSelf: 'stretch', flexShrink: 0 }}>
+      {turn.text && (
+        <div className="chat-md">
+          <ReactMarkdown>{turn.text}</ReactMarkdown>
+        </div>
+      )}
+      {turn.toolCalls.map(tc => (
+        <ToolCallBubble key={tc.id} tc={tc} />
+      ))}
+      {!turn.done && !turn.text && turn.toolCalls.length === 0 && (
+        <div style={{ fontSize: 12, color: '#aaa', fontFamily: FONT_UI }}>Thinking…</div>
+      )}
+    </div>
+  )
+}
+
 // ─── ChatPanel ────────────────────────────────────────────────────────────────
 
-export function ChatPanel({
-  contextHint,
-  pages,
-  dataStore,
-  components,
-  onApplyActions,
-  onApplyDataAction,
-  onApplyComponentAction,
-}: {
+export const ChatPanel = forwardRef<ChatPanelHandle, {
   contextHint?: string
   pages: PageDef[]
   dataStore: Record<string, unknown>
@@ -744,7 +1091,17 @@ export function ChatPanel({
   onApplyActions: (actions: ChatAction[]) => void
   onApplyDataAction: (action: DataAction) => void
   onApplyComponentAction: (action: ComponentAction) => void
-}) {
+  onTurnsChange?: (turns: TurnEntry[]) => void
+}>(function ChatPanel({
+  contextHint,
+  pages,
+  dataStore,
+  components,
+  onApplyActions,
+  onApplyDataAction,
+  onApplyComponentAction,
+  onTurnsChange,
+}, ref) {
   const [turns, setTurns] = useState<TurnEntry[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -854,6 +1211,7 @@ export function ChatPanel({
       if (event.type === 'tool_execution_start') {
         const toolName = event.toolName
         const labels: Record<string, string> = {
+          imagine: 'imagine',
           list_pages: 'list_pages',
           read_page: 'read_page',
           set_page: 'set_page',
@@ -937,10 +1295,7 @@ export function ChatPanel({
   // Keep drainQueueRef current so the agent event handler (closed over on mount) can call it
   useEffect(() => { drainQueueRef.current = drainQueue }, [drainQueue])
 
-  const send = useCallback(() => {
-    const text = input.trim()
-    if (!text) return
-
+  const sendMessage = useCallback((text: string) => {
     const apiKey = import.meta.env.VITE_OPENROUTER_API_KEY as string | undefined
     if (!apiKey) {
       setError('Add VITE_OPENROUTER_API_KEY to your .env file.')
@@ -951,22 +1306,31 @@ export function ChatPanel({
       return
     }
 
-    setInput('')
-
-    // Add user message to UI immediately
     setTurns(prev => [
       ...prev,
       { id: crypto.randomUUID(), role: 'user', text, toolCalls: [], done: true },
     ])
 
     if (loadingRef.current) {
-      // Agent is busy — queue for later
       messageQueueRef.current.push(text)
       setQueuedCount(messageQueueRef.current.length)
     } else {
       dispatchMessage(text)
     }
-  }, [input, dispatchMessage])
+  }, [dispatchMessage])
+
+  const send = useCallback(() => {
+    const text = input.trim()
+    if (!text) return
+    setInput('')
+    sendMessage(text)
+  }, [input, sendMessage])
+
+  useImperativeHandle(ref, () => ({ sendMessage }), [sendMessage])
+
+  useEffect(() => {
+    onTurnsChange?.(turns)
+  }, [turns, onTurnsChange])
 
   const rootStyle: CSSProperties = {
     flex: 1, display: 'flex', flexDirection: 'column',
@@ -1102,4 +1466,4 @@ export function ChatPanel({
       </form>
     </div>
   )
-}
+})
